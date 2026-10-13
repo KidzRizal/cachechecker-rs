@@ -525,8 +525,9 @@ fn real_main(cli: Cli) -> Result<()> {
             }
             if !common.quiet {
                 report::banner();
-                if cfg!(windows) && !is_admin() {
-                    println!("{}", paint("  (info) Tidak berjalan sebagai Administrator — beberapa folder sistem akan dilewati.", C_DIM));
+                if !is_admin() {
+                    let hint = if cfg!(windows) { "Administrator" } else { "root (sudo)" };
+                    println!("{}", paint(format!("  (info) Tidak berjalan sebagai {hint} — beberapa folder sistem akan dilewati."), C_DIM));
                 }
                 println!(
                     "  Scanning {} dengan {} thread… {}",

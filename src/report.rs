@@ -87,7 +87,8 @@ pub fn print_summary(r: &ScanResult, top: usize, show_stats: bool) {
     );
     kv("Aman hapus", paint(human_size(t.cache_safe_size), "1;38;2;158;206;106"));
     if t.errors > 0 {
-        kv("Error akses", format!("{} {}", paint(fmt_num(t.errors), C_RED), paint("(jalankan sebagai Administrator untuk akses penuh)", C_DIM)));
+        let hint = if cfg!(windows) { "jalankan sebagai Administrator untuk akses penuh" } else { "jalankan sebagai root (sudo) untuk akses penuh" };
+        kv("Error akses", format!("{} {}", paint(fmt_num(t.errors), C_RED), paint(format!("({hint})"), C_DIM)));
     }
 
     if !r.drives.is_empty() {

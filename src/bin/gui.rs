@@ -1395,7 +1395,12 @@ impl App {
                         })
                         .response;
                     if !self.admin {
-                        resp.on_hover_text("Jalankan sebagai Administrator untuk membaca folder sistem (Windows\\Temp, dll)");
+                        let hint = if cfg!(windows) {
+                            "Jalankan sebagai Administrator untuk membaca folder sistem (Windows\\Temp, dll)"
+                        } else {
+                            "Jalankan sebagai root (sudo) untuk membaca folder sistem"
+                        };
+                        resp.on_hover_text(hint);
                     }
                     ui.add_space(8.0);
                     if let Some(r) = &self.result {

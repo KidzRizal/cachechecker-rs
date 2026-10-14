@@ -139,6 +139,8 @@ struct Shared<'a> {
     registry: Mutex<(Vec<CacheEntry>, HashMap<String, usize>)>,
     locals: Vec<Mutex<Local>>,
     now: f64,
+    /// mount point -> source device (Linux). Kosong di OS lain.
+    mounts: HashMap<PathBuf, Arc<str>>,
 }
 
 struct Job {
@@ -146,6 +148,8 @@ struct Job {
     drive: Arc<str>,
     top: Option<Arc<str>>,
     cid: Option<usize>,
+    /// Source device dari mount tempat root berada (Linux).
+    dev: Option<Arc<str>>,
 }
 
 impl Shared<'_> {
@@ -212,6 +216,69 @@ fn mtime_of(md: &fs::Metadata) -> f64 {
         .unwrap_or(0.0)
 }
 
+// ===================================================================== mount (Linux)
+
+/// Decode escape oktal di mountinfo (`\040` = spasi, dll).
+#[cfg(target_os = "linux")]
+fn unescape_mount(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c)) {
+            let v = (b[i + 1] - b'0') as u32 * 64 + (b[i + 2] - b'0') as u32 * 8 + (b[i + 3] - b'0') as u32;
+            out.push(v as u8);
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Tabel mount point -> source device dari /proc/self/mountinfo.
+#[cfg(target_os = "linux")]
+fn mount_table() -> HashMap<PathBuf, Arc<str>> {
+    let mut m = HashMap::new();
+    let Ok(text) = fs::read_to_string("/proc/self/mountinfo") else { return m };
+    for line in text.lines() {
+        // <id> <parent> <maj:min> <root> <mount point> <opts> [optional...] - <fstype> <source> <super opts>
+        let Some((left, right)) = line.split_once(" - ") else { continue };
+        let l: Vec<&str> = left.split(' ').collect();
+        let r: Vec<&str> = right.split(' ').collect();
+        if l.len() < 5 || r.len() < 2 {
+            continue;
+        }
+        // mount yang lebih baru (baris belakang) menimpa yang lama di path sama
+        m.insert(PathBuf::from(unescape_mount(l[4])), Arc::from(unescape_mount(r[1]).as_str()));
+    }
+    m
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_table() -> HashMap<PathBuf, Arc<str>> {
+    HashMap::new()
+}
+
+/// Source device dari mount terdalam yang memuat `p`.
+fn mount_source_of(mounts: &HashMap<PathBuf, Arc<str>>, p: &Path) -> Option<Arc<str>> {
+    p.ancestors().find_map(|a| mounts.get(a).cloned())
+}
+
+/// Jangan menyeberang ke mount lain (seperti `du -x`): /proc, /sys, /dev, /run,
+/// tmpfs, dan disk lain yang di-mount di bawah root. Subvolume btrfs dari device
+/// yang sama (mis. /home) tetap ikut.
+fn crosses_mount(sh: &Shared<'_>, path: &Path, dev: &Option<Arc<str>>) -> bool {
+    match sh.mounts.get(path) {
+        None => false,
+        Some(src) => match dev {
+            Some(d) => !(src == d && d.starts_with('/')),
+            None => true,
+        },
+    }
+}
+
 // ===================================================================== walk
 
 fn visit<'s>(scope: &rayon::Scope<'s>, sh: &'s Shared<'s>, job: Job) {
@@ -264,6 +331,9 @@ fn visit<'s>(scope: &rayon::Scope<'s>, sh: &'s Shared<'s>, job: Job) {
             if sh.excluded(&path, &lname) {
                 continue;
             }
+            if !sh.mounts.is_empty() && crosses_mount(sh, &path, &job.dev) {
+                continue;
+            }
             let mut sub_cid = job.cid;
             if o.detect_cache && job.cid.is_none() {
                 let mut hit: Option<(Sig, &'static str)> = sh.known.get(&norm_path(&path)).map(|s| (*s, "known"));
@@ -280,8 +350,16 @@ fn visit<'s>(scope: &rayon::Scope<'s>, sh: &'s Shared<'s>, job: Job) {
                 }
             }
             let top = job.top.clone().or_else(|| Some(Arc::from(name.as_str())));
-            subdirs.push(Job { path, drive: job.drive.clone(), top, cid: sub_cid });
+            subdirs.push(Job { path, drive: job.drive.clone(), top, cid: sub_cid, dev: job.dev.clone() });
             continue;
+        }
+        // file spesial (socket, fifo, device) tidak punya ukuran isi yang berarti
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            if ft.is_block_device() || ft.is_char_device() || ft.is_fifo() || ft.is_socket() {
+                continue;
+            }
         }
         match ent.metadata() {
             Ok(md) => {
@@ -401,9 +479,15 @@ pub fn run(o: &ScanOptions, progress: &Progress) -> ScanResult {
         registry: Mutex::new((Vec::new(), HashMap::new())),
         locals: (0..threads + 1).map(|_| Mutex::new(Local::default())).collect(),
         now,
+        mounts: mount_table(),
     };
 
-    let roots: Vec<PathBuf> = o.roots.iter().map(|r| abs_path(r)).filter(|r| r.is_dir()).collect();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for r in o.roots.iter().map(|r| abs_path(r)).filter(|r| r.is_dir()) {
+        if !roots.contains(&r) {
+            roots.push(r);
+        }
+    }
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("thread pool");
     pool.install(|| {
         rayon::scope(|s| {
@@ -418,7 +502,8 @@ pub fn run(o: &ScanOptions, progress: &Progress) -> ScanResult {
                 } else {
                     None
                 };
-                let job = Job { path: r.clone(), drive, top: None, cid };
+                let dev = mount_source_of(&sh.mounts, r);
+                let job = Job { path: r.clone(), drive, top: None, cid, dev };
                 let shr = &sh;
                 s.spawn(move |s2| visit(s2, shr, job));
             }
